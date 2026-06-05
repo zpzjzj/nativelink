@@ -1114,6 +1114,92 @@ async fn matching_engine_fails_sends_abort() -> Result<(), Error> {
     Ok(())
 }
 
+// A queued operation can outlive its backing `AwaitedAction` when a
+// store-backed `AwaitedActionDb` (e.g. Redis) drops the action (completion,
+// TTL expiry, or a concurrent writer) while a stale entry lingers in the
+// queued index. `as_action_info()` then returns `NotFound`. The matching
+// engine must skip that single operation rather than aborting the whole
+// `do_try_match` cycle (which would stall every other queued action), while
+// still propagating genuine (non-`NotFound`) errors.
+#[nativelink_test]
+async fn do_try_match_skips_stale_queued_operation() -> Result<(), Error> {
+    // A `NotFound` queued operation is skipped and the cycle succeeds.
+    {
+        let task_change_notify = Arc::new(Notify::new());
+        let (senders, awaited_action) = RxMockAwaitedAction::new();
+        let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+            &SimpleSpec::default(),
+            awaited_action,
+            || async move {},
+            task_change_notify,
+            MockInstantWrapped::default,
+            None,
+        );
+        // Initial worker setup calls do_try_match, so send it no items.
+        senders.get_range_of_actions.send(vec![]).unwrap();
+        let _worker_rx = setup_new_worker(
+            &scheduler,
+            WorkerId("worker_id".to_string()),
+            PlatformProperties::default(),
+        )
+        .await
+        .unwrap();
+
+        // Stale index entry: its `as_action_info()` resolves to `NotFound`.
+        senders
+            .get_range_of_actions
+            .send(vec![Err(make_err!(
+                Code::NotFound,
+                "AwaitedAction is gone (stale index entry)"
+            ))])
+            .unwrap();
+
+        assert_eq!(scheduler.do_try_match_for_test().await, Ok(()));
+    }
+    // The stale entry is skipped *and* a following operation is still
+    // processed: a `NotFound` followed by a genuine error surfaces that
+    // genuine error (proving the cycle did not stop at the skipped entry,
+    // and that non-`NotFound` errors are not swallowed).
+    {
+        let task_change_notify = Arc::new(Notify::new());
+        let (senders, awaited_action) = RxMockAwaitedAction::new();
+        let (scheduler, _worker_scheduler) = SimpleScheduler::new_with_callback(
+            &SimpleSpec::default(),
+            awaited_action,
+            || async move {},
+            task_change_notify,
+            MockInstantWrapped::default,
+            None,
+        );
+        senders.get_range_of_actions.send(vec![]).unwrap();
+        let _worker_rx = setup_new_worker(
+            &scheduler,
+            WorkerId("worker_id".to_string()),
+            PlatformProperties::default(),
+        )
+        .await
+        .unwrap();
+
+        senders
+            .get_range_of_actions
+            .send(vec![
+                Err(make_err!(Code::NotFound, "AwaitedAction is gone")),
+                Err(make_err!(
+                    Code::Internal,
+                    "This means an internal error happened."
+                )),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            scheduler.do_try_match_for_test().await.unwrap_err().code,
+            Code::Internal
+        );
+    }
+
+    Ok(())
+}
+
 #[nativelink_test]
 async fn worker_timesout_reschedules_running_job_test() -> Result<(), Error> {
     MockClock::set_time(Duration::from_secs(NOW_TIME));

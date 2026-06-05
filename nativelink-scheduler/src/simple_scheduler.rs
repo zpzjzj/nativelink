@@ -223,11 +223,31 @@ impl SimpleScheduler {
             platform_property_manager: &PlatformPropertyManager,
             full_worker_logging: bool,
         ) -> Result<(), Error> {
-            let (action_info, maybe_origin_metadata) =
-                action_state_result
-                    .as_action_info()
-                    .await
-                    .err_tip(|| "Failed to get action_info from as_action_info_result stream")?;
+            let (action_info, maybe_origin_metadata) = match action_state_result
+                .as_action_info()
+                .await
+            {
+                Ok(v) => v,
+                // A queued operation can outlive its backing `AwaitedAction`
+                // in a store-backed `AwaitedActionDb`: the action completes or
+                // is removed between being listed by `get_range_of_actions`
+                // and `as_action_info()` re-fetching it, or the search index
+                // lags behind the keys. `borrow()` then returns `NotFound`.
+                // Skip just this operation; otherwise its error poisons the
+                // merged cycle result (`result.merge`), so every cycle logs an
+                // error and busy-retries while the stale entry lingers.
+                Err(err) if err.code == Code::NotFound => {
+                    debug!(
+                        ?err,
+                        "Skipping queued operation with no backing AwaitedAction (stale index)"
+                    );
+                    return Ok(());
+                }
+                Err(err) => {
+                    return Err(err)
+                        .err_tip(|| "Failed to get action_info from as_action_info_result stream");
+                }
+            };
 
             // TODO(palfrey) We should not compute this every time and instead store
             // it with the ActionInfo when we receive it.

@@ -1,0 +1,88 @@
+name: Fetch downloader validation
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci/fetch-downloader-validation]
+permissions:
+  contents: read
+concurrency:
+  group: fetch-downloader-validation
+  cancel-in-progress: true
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUSTFLAGS: -Dwarnings
+jobs:
+  service:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: 5bee2ac868dbaa4c61d0f3c15060bcef2acc81aa
+          fetch-depth: 0
+      - name: Record source
+        run: git rev-parse HEAD | tee validation-source.txt
+      - name: Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component clippy && rustup default 1.97.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          shared-key: fetch-downloader-service
+          cache-on-failure: true
+      - name: Prove checksum regressions fail before fixes
+        run: |
+          python3 - <<'PYBASELINE'
+          from pathlib import Path
+          import subprocess
+          source = Path("nativelink-service/src/fetch_server.rs")
+          fixed = source.read_bytes()
+          try:
+              source.write_bytes(subprocess.check_output(["git", "show", "2293c90ec311966e88df23288e3277d853ee4664:nativelink-service/src/fetch_server.rs"]))
+              for test in ["cache_key_collision_does_not_bypass_requested_checksum", "cache_key_collision_checks_qualifier_boundaries", "checksum_sri_accepts_supported_alternatives"]:
+                  result = subprocess.run(["cargo", "test", "--locked", "-p", "nativelink-service", "--test", "fetch_server_test", "--", "--exact", test, "--nocapture"], capture_output=True, text=True)
+                  output = result.stdout + result.stderr
+                  if result.returncode == 0 or "test result: FAILED" not in output:
+                      print(output[-6000:])
+                      raise SystemExit("Baseline did not fail for " + test)
+                  print("Expected baseline failure confirmed: " + test)
+          finally:
+              source.write_bytes(fixed)
+          PYBASELINE
+      - name: Build service tests
+        run: cargo build --locked -p nativelink-service --test fetch_server_test --test push_server_test
+      - name: Fetch and Push regressions
+        run: cargo test --locked -p nativelink-service --test fetch_server_test --test push_server_test
+      - name: Clippy without warnings
+        run: cargo clippy --locked --no-deps -p nativelink-config -p nativelink-service --all-targets -- -D warnings
+      - name: Build server binary
+        if: ${{ !cancelled() }}
+        run: cargo build --locked --bin nativelink
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        if: always()
+        with:
+          name: fetch-validation-source
+          path: validation-source.txt
+  schema:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: 5bee2ac868dbaa4c61d0f3c15060bcef2acc81aa
+          fetch-depth: 0
+      - name: Rust toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal && rustup default 1.97.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          shared-key: fetch-downloader-schema
+          cache-on-failure: true
+      - name: Fetch upstream release tags for the reference generator
+        run: git fetch https://github.com/TraceMachina/nativelink.git 'refs/tags/v1.*:refs/tags/v1.*'
+      - name: Generate configuration reference from Rust
+        run: node web/apps/docs/scripts/gen-config-reference.mjs main
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: fetch-config-reference
+          path: web/apps/docs/content/docs/reference/nativelink-config/main.mdx

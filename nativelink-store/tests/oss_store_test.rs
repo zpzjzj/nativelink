@@ -78,6 +78,7 @@ fn endpoint_and_minimal_settings() -> Result<(), Error> {
     assert_eq!(aws.common.key_prefix.as_deref(), Some("cas/"));
     assert_eq!(aws.common.retry.max_retries, 1);
     assert_eq!(aws.common.consider_expired_after_s, 0);
+    assert_eq!(aws.common.multipart_max_concurrent_uploads, Some(2));
     Ok(())
 }
 
@@ -100,6 +101,15 @@ fn rejects_invalid_config_without_echoing_endpoint_credentials() {
         assert!(!err.to_string().contains("hidden"));
         assert!(!err.to_string().contains("secret@example"));
     }
+    assert_eq!(
+        OssStore::build_aws_spec(&ExperimentalOssSpec {
+            multipart_max_concurrent_uploads: Some(0),
+            ..spec()
+        })
+        .unwrap_err()
+        .code,
+        Code::InvalidArgument
+    );
     for bucket in [
         "",
         "ab",
@@ -194,8 +204,7 @@ async fn ranged_get_and_encoded_key_use_oss_endpoint() -> Result<(), Error> {
             .uri()
             .starts_with(&format!("https://{HOST}/cas/a%20b%3Fc"))
     );
-    // The shared S3 store requests an inclusive extra byte then caps delivery.
-    assert_eq!(requests[0].headers().get("range"), Some("bytes=1-4"));
+    assert_eq!(requests[0].headers().get("range"), Some("bytes=1-3"));
     Ok(())
 }
 
@@ -209,6 +218,8 @@ async fn single_put_does_not_enable_aws_chunked_encoding() -> Result<(), Error> 
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
     assert_eq!(request.method(), "PUT");
+    assert_eq!(request.headers().get("content-length"), Some("5"));
+    assert!(request.headers().get("transfer-encoding").is_none());
     assert!(
         request
             .uri()
@@ -272,6 +283,9 @@ async fn multipart_upload_initiates_uploads_and_completes() -> Result<(), Error>
     assert!(requests[1].uri().contains("uploadId=upload-1"));
     assert_eq!(requests[2].method(), "POST");
     assert!(requests[2].uri().contains("uploadId=upload-1"));
+    let completion = std::str::from_utf8(requests[2].body().bytes().unwrap()).unwrap();
+    assert!(completion.contains("<PartNumber>1</PartNumber>"));
+    assert!(completion.contains("<ETag>part-etag</ETag>"));
     Ok(())
 }
 
@@ -329,5 +343,178 @@ async fn transient_head_retries_through_shared_store() -> Result<(), Error> {
         Some(5)
     );
     assert_eq!(mock.actual_requests().count(), 2);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn streaming_read_requests_exact_inclusive_range() -> Result<(), Error> {
+    let mock = StaticReplayClient::new(vec![event(StatusCode::PARTIAL_CONTENT, "bcd")]);
+    let store = store(mock.clone())?;
+    let (mut tx, mut rx) = make_buf_channel_pair();
+    let read = store.get_part(StoreKey::new_str("key"), &mut tx, 1, Some(3));
+    let (_, bytes) = futures::try_join!(read, rx.consume(None))?;
+    assert_eq!(bytes, "bcd");
+    let requests: Vec<_> = mock.actual_requests().collect();
+    assert_eq!(requests[0].headers().get("range"), Some("bytes=1-3"));
+    Ok(())
+}
+
+#[nativelink_test]
+async fn zero_length_read_makes_no_request() -> Result<(), Error> {
+    let mock = StaticReplayClient::new(vec![]);
+    let bytes = store(mock.clone())?
+        .get_part_unchunked(StoreKey::new_str("key"), 1, Some(0))
+        .await?;
+    assert!(bytes.is_empty());
+    assert_eq!(mock.actual_requests().count(), 0);
+    Ok(())
+}
+
+#[nativelink_test]
+async fn endpoint_override_and_temporary_credentials_reach_the_wire() -> Result<(), Error> {
+    let mock = StaticReplayClient::new(vec![event(StatusCode::NOT_FOUND, "")]);
+    let spec = ExperimentalOssSpec {
+        endpoint: Some("https://s3.oss-cn-hangzhou-internal.aliyuncs.com".into()),
+        ..spec()
+    };
+    let store = OssStore::new_with_http_client(
+        &spec,
+        mock.clone(),
+        Credentials::new(
+            "TESTKEY",
+            "TESTSECRET",
+            Some("TESTTOKEN".into()),
+            None,
+            "test",
+        ),
+        NOW,
+    )?;
+    assert_eq!(store.has(StoreKey::new_str("key")).await?, None);
+    let requests: Vec<_> = mock.actual_requests().collect();
+    assert_eq!(
+        requests[0].uri(),
+        "https://test-bucket.s3.oss-cn-hangzhou-internal.aliyuncs.com/cas/key"
+    );
+    assert_eq!(
+        requests[0].headers().get("x-amz-security-token"),
+        Some("TESTTOKEN")
+    );
+    Ok(())
+}
+
+#[nativelink_test]
+async fn exact_size_error_does_not_publish_an_object() -> Result<(), Error> {
+    let mock = StaticReplayClient::new(vec![]);
+    let store = store(mock.clone())?;
+    let (mut tx, rx) = make_buf_channel_pair();
+    let upload = store.update(StoreKey::new_str("key"), rx, UploadSizeInfo::ExactSize(4));
+    let send = async {
+        tx.send("abc".into()).await?;
+        tx.send_eof()
+    };
+    let (written, sent) = tokio::join!(upload, send);
+    sent?;
+    assert_eq!(written.unwrap_err().code, Code::InvalidArgument);
+    assert_eq!(mock.actual_requests().count(), 0);
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct GatedPartClient {
+    gate: Arc<tokio::sync::Semaphore>,
+    started: Arc<tokio::sync::Notify>,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+    parts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl aws_smithy_runtime_api::client::http::HttpConnector for GatedPartClient {
+    fn call(
+        &self,
+        request: aws_smithy_runtime_api::client::orchestrator::HttpRequest,
+    ) -> aws_smithy_runtime_api::client::http::HttpConnectorFuture {
+        use std::sync::atomic::Ordering;
+        let client = self.clone();
+        aws_smithy_runtime_api::client::http::HttpConnectorFuture::new(async move {
+            let response = if request.uri().contains("partNumber=") {
+                client.parts.fetch_add(1, Ordering::SeqCst);
+                let active = client.active.fetch_add(1, Ordering::SeqCst) + 1;
+                client.peak.fetch_max(active, Ordering::SeqCst);
+                client.started.notify_one();
+                client.gate.acquire().await.unwrap().forget();
+                client.active.fetch_sub(1, Ordering::SeqCst);
+                http::Response::builder()
+                    .header("etag", "part-etag")
+                    .body(SdkBody::empty())
+                    .unwrap()
+            } else if request.uri().contains("uploads") {
+                http::Response::builder().body(SdkBody::from("<InitiateMultipartUploadResult><UploadId>upload-1</UploadId></InitiateMultipartUploadResult>")).unwrap()
+            } else {
+                http::Response::builder().body(SdkBody::from("<CompleteMultipartUploadResult><ETag>object-etag</ETag></CompleteMultipartUploadResult>")).unwrap()
+            };
+            Ok(response.try_into().unwrap())
+        })
+    }
+}
+
+impl aws_smithy_runtime_api::client::http::HttpClient for GatedPartClient {
+    fn http_connector(
+        &self,
+        _: &aws_smithy_runtime_api::client::http::HttpConnectorSettings,
+        _: &aws_smithy_runtime_api::client::runtime_components::RuntimeComponents,
+    ) -> aws_smithy_runtime_api::client::http::SharedHttpConnector {
+        aws_smithy_runtime_api::client::http::SharedHttpConnector::new(self.clone())
+    }
+}
+
+#[nativelink_test]
+async fn slow_backend_bounds_in_flight_multipart_requests() -> Result<(), Error> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const PARTS: usize = 12;
+    const PART_BYTES: usize = 5 * 1024 * 1024;
+    let client = GatedPartClient {
+        gate: Arc::new(tokio::sync::Semaphore::new(0)),
+        started: Arc::new(tokio::sync::Notify::new()),
+        active: Arc::new(AtomicUsize::new(0)),
+        peak: Arc::new(AtomicUsize::new(0)),
+        parts: Arc::new(AtomicUsize::new(0)),
+    };
+    let store = OssStore::new_with_http_client(
+        &spec(),
+        client.clone(),
+        Credentials::new("TESTKEY", "TESTSECRET", None, None, "test"),
+        NOW,
+    )?;
+    let (mut tx, rx) = make_buf_channel_pair();
+    let upload = tokio::spawn(async move {
+        store
+            .update(
+                StoreKey::new_str("key"),
+                rx,
+                UploadSizeInfo::ExactSize((PARTS * PART_BYTES) as u64),
+            )
+            .await
+    });
+    let send = tokio::spawn(async move {
+        let chunk = bytes::Bytes::from(vec![1; PART_BYTES]);
+        for _ in 0..PARTS {
+            tx.send(chunk.clone()).await?;
+        }
+        tx.send_eof()
+    });
+    client.started.notified().await;
+    // Give the producer and upload loop opportunities to fill the limit while
+    // the connector deliberately keeps all part requests pending.
+    for _ in 0..1024 {
+        tokio::task::yield_now().await;
+    }
+    let peak_while_blocked = client.peak.load(Ordering::SeqCst);
+    client.gate.add_permits(PARTS);
+    let written = upload.await.unwrap()?;
+    send.await.unwrap()?;
+    assert_eq!(written, (PARTS * PART_BYTES) as u64);
+    assert_eq!(client.parts.load(Ordering::SeqCst), PARTS);
+    assert!(peak_while_blocked > 0 && peak_while_blocked <= 2);
+    assert!(client.peak.load(Ordering::SeqCst) <= 2);
     Ok(())
 }

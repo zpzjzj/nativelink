@@ -230,6 +230,21 @@ pub enum StoreSpec {
     ///      }
     ///    }
     ///    ```
+    ///
+    /// 7. **Alibaba Cloud OSS:**
+    ///    Uses the OSS S3-compatible endpoint and AWS SigV4. Supply the OSS
+    ///    AccessKey using the AWS SDK credential chain (for example
+    ///    `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`).
+    ///
+    ///    **Example JSON Config:**
+    ///    ```json
+    ///    "experimental_cloud_object_store": {
+    ///      "provider": "oss",
+    ///      "region": "cn-hangzhou",
+    ///      "bucket": "example-build-cache",
+    ///      "key_prefix": "cas/"
+    ///    }
+    ///    ```
     ExperimentalCloudObjectStore(ExperimentalCloudObjectSpec),
 
     /// ONTAP S3 Existence Cache provides a caching layer on top of the ONTAP S3 store
@@ -978,6 +993,15 @@ pub struct ExperimentalOssSpec {
     /// multiplying attempts. Default: the standard store retry policy.
     #[serde(default)]
     pub retry: Retry,
+
+    /// Maximum concurrent part requests per upload. Must be positive.
+    /// Default: 2. Queued parts are bounded by the same count; this is not
+    /// a global byte budget. Part size is chosen by the shared S3 store.
+    #[serde(
+        default,
+        deserialize_with = "convert_optional_numeric_with_shellexpand"
+    )]
+    pub multipart_max_concurrent_uploads: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

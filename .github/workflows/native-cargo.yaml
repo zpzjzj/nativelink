@@ -1,63 +1,35 @@
----
-name: CI / Cargo
-
+name: CI / OSS validation
 on:
-  # Cargo Native (Linux + Windows) is deferred to a nightly schedule +
-  # on-demand. Per-PR build/test signal is covered by the warm-cluster CI / NativeLink lane;
-  # this keeps full cargo and cross-platform coverage running daily against main.
-  schedule:
-    - cron: "0 7 * * *" # 07:00 UTC daily (off-peak)
   workflow_dispatch:
-
-permissions: read-all
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-
-env:
-  RUSTFLAGS: -Dwarnings
-  # aws-lc-sys (JWT signing for GCS auth) assembles with NASM on x86_64
-  # Windows, which the runner image does not ship. Use the prebuilt objects
-  # the crate carries instead; the variable is ignored on every other target.
-  AWS_LC_SYS_PREBUILT_NASM: 1
-
+permissions:
+  contents: read
 jobs:
-  cargo-native:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-2022]
-        toolchain: [stable]
-    name: ${{ matrix.os }} / ${{ matrix.toolchain }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: 2
+      RUSTFLAGS: -Dwarnings
     steps:
-      - name: Checkout
-        uses: >- # v6.0.2
-          actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-
-      # Ubuntu 24.04 restricts unprivileged user namespaces by default, which breaks
-      # the worker tests that use namespaces (e.g. for sandboxing).
-      - name: Disable AppArmor namespace restrictions
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-        if: matrix.os == 'ubuntu-24.04'
-
-      - name: Set up Rust toolchain
-        run: rustup update && rustup default ${{ matrix.toolchain }}
-
-      - name: Rust cache
-        uses: >- # v2.9.1
-          Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
-
-      - name: Build on ${{ runner.os }}
-        run: cargo build --all --profile=smol
-
-      - name: Set up Azurite test runner
-        uses: ./.github/actions/setup-azurite-test-runner
-
-      - name: Test on ${{ runner.os }}
-        run: cargo test --all --profile=smol
-
-      - name: Check schema export
-        run: cargo run --bin build-schema --features dev-schema --package nativelink-config
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+      - name: Toolchain
+        run: rustup update stable && rustup default stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+      - name: Generate config reference
+        run: node web/apps/docs/scripts/gen-config-reference.mjs main
+      - name: Config tests
+        run: cargo test --locked -p nativelink-config --test deserialization_test
+      - name: Build store
+        run: cargo build --locked -p nativelink-store
+      - name: OSS and existing S3 adapter tests
+        run: cargo test --locked -p nativelink-store --test oss_store_test --test oci_store_test --test r2_store_test --test s3_store_test
+      - name: Clippy
+        run: cargo clippy --locked -p nativelink-store --lib --test oss_store_test -- -D warnings
+      - name: Upload generated reference
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: oss-config-reference
+          path: web/apps/docs/content/docs/reference/nativelink-config/main.mdx

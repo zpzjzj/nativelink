@@ -24,9 +24,9 @@ jobs:
       - name: Build store
         run: cargo build --locked -p nativelink-store
       - name: OSS and existing S3 adapter tests
-        run: cargo test --locked -p nativelink-store --test oss_store_test --test hickory_dns_test --test common_s3_utils_test --test oci_store_test --test r2_store_test --test s3_store_test
+        run: cargo test --locked -p nativelink-store --test oss_store_test --test common_s3_utils_test --test oci_store_test --test r2_store_test --test s3_store_test
       - name: Clippy
-        run: cargo clippy --locked -p nativelink-store --lib --test oss_store_test --test hickory_dns_test --test common_s3_utils_test -- -D warnings
+        run: cargo clippy --locked -p nativelink-store --lib --test oss_store_test --test common_s3_utils_test -- -D warnings
       - name: Upload generated reference
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08

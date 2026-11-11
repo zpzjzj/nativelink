@@ -27,10 +27,10 @@ variables such as `OSS_ACCESS_KEY_ID` and `OSS_ACCESS_KEY_SECRET` through shell
 expansion. For temporary credentials, also configure `session_token`, for example
 `${OSS_SESSION_TOKEN}`. Keep the values out of source control.
 
-There is no fallback to the AWS credential chain or `AWS_*` variables, so an AWS
-S3 store in the same process can use its own credentials. Different OSS stores
-can reference different variable names. Automatic Alibaba Cloud RAM role
-discovery is not supported.
+The provider requires explicit credentials and ignores the AWS credential chain
+and `AWS_*` variables, so an AWS S3 store in the same process can use its own
+credentials. Different OSS stores can reference different variable names.
+Automatic Alibaba Cloud RAM role discovery is not supported.
 
 ```json5
 stores: [
@@ -61,7 +61,7 @@ for the bucket's account and region before deploying.
 
 The optional `retry` object uses the standard store retry policy. SDK retries
 are disabled, but the shared HTTP transport also retries: its attempts can
-multiply the store retry loop. There is not yet one total retry budget.
+multiply the store retry loop. A total retry budget is not yet implemented.
 
 Each SDK operation attempt has a 120-second timeout. The custom HTTP connector
 does not currently apply the SDK connection-timeout setting to TCP connections.
@@ -74,8 +74,9 @@ multipart uploads and transfer size validation. Its buffering and concurrency
 behavior is inherited. `multipart_max_concurrent_uploads` bounds both queued
 parts and concurrent part requests per upload (default: 2). Part sizes depend
 on the declared upload size. This adapter does not provide a global byte budget
-or upload admission queue. There are no OSS-specific spool, TTL, or read-proxy
-settings. To expire cached objects, configure bucket lifecycle rules separately.
+or upload admission queue. OSS-specific spool, TTL, and read-proxy settings are
+not supported. To expire cached objects, configure bucket lifecycle rules
+separately.
 
 ## Verify [#verify]
 

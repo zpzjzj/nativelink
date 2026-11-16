@@ -6537,10 +6537,33 @@ pub struct Metrics {
 mod tests {
     use core::sync::atomic::AtomicU32;
 
+    use nativelink_error::ErrorContext;
     use nativelink_macro::nativelink_test;
     use pretty_assertions::assert_eq;
 
     use super::*;
+
+    #[test]
+    fn only_missing_digest_is_tagged_as_missing_input() {
+        let local_error = make_err!(Code::NotFound, "No such file or directory (os error 2)")
+            .append("Could not open worker input path");
+        assert_eq!(tag_missing_input(local_error.clone()), local_error);
+        let missing = make_err!(Code::NotFound, "CAS blob missing").with_context(
+            ErrorContext::MissingDigest {
+                hash: "abc".to_string(),
+                size: 42,
+            },
+        );
+        assert_eq!(
+            tag_missing_input(missing.clone()),
+            missing.clone().append(MISSING_INPUT_ERROR_TIP)
+        );
+        let other_error = Error {
+            code: Code::Unavailable,
+            ..missing
+        };
+        assert_eq!(tag_missing_input(other_error.clone()), other_error);
+    }
 
     fn test_digest(first_byte: u8) -> DigestInfo {
         let mut hash = [0u8; 32];

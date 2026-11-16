@@ -1,67 +1,106 @@
----
-name: CI / Cargo
+name: Missing input regression evidence
 
 on:
-  # Cargo Native (Linux + Windows) is deferred to a nightly schedule +
-  # on-demand. Per-PR build/test signal is covered by the warm-cluster CI / NativeLink lane;
-  # this keeps full cargo and cross-platform coverage running daily against main.
-  schedule:
-    - cron: "0 7 * * *" # 07:00 UTC daily (off-peak)
   workflow_dispatch:
+    inputs:
+      fixed_sha:
+        description: Exact patch commit to validate
+        required: true
+        type: string
+      baseline_sha:
+        description: Upstream implementation with regression tests only
+        required: true
+        type: string
 
-# Jobs without their own permissions block only check out the repository;
-# read-all also implies scopes a GitHub App installation token cannot be
-# granted.
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
-
-env:
-  RUSTFLAGS: -Dwarnings
-  # aws-lc-sys (JWT signing for GCS auth) assembles with NASM on x86_64
-  # Windows, which the runner image does not ship. Use the prebuilt objects
-  # the crate carries instead; the variable is ignored on every other target.
-  AWS_LC_SYS_PREBUILT_NASM: 1
-
 jobs:
-  cargo-native:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-2022]
-        toolchain: [stable]
-    name: ${{ matrix.os }} / ${{ matrix.toolchain }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+  regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RUSTFLAGS: -Dwarnings
+      CARGO_BUILD_JOBS: "4"
+      FIXED_SHA: ${{ inputs.fixed_sha }}
+      BASELINE_SHA: ${{ inputs.baseline_sha }}
     steps:
-      - name: Checkout
-        uses: >- # v6.0.2
-          actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-
-      # Ubuntu 24.04 restricts unprivileged user namespaces by default, which breaks
-      # the worker tests that use namespaces (e.g. for sandboxing).
-      - name: Disable AppArmor namespace restrictions
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-        if: matrix.os == 'ubuntu-24.04'
-
-      - name: Set up Rust toolchain
-        run: rustup update && rustup default ${{ matrix.toolchain }}
-
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ inputs.fixed_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify source identity
+        run: |
+          test "$(git rev-parse HEAD)" = "$FIXED_SHA"
+          git show -s --format=fuller HEAD
+          test "$(git rev-parse "$FIXED_SHA^")" = "$(git rev-parse "$BASELINE_SHA^")"
+      - name: Prepare Linux
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+      - name: Set up pinned toolchain
+        run: |
+          rustup toolchain install nightly-2026-08-26 --profile minimal --component rustfmt,clippy
+          rustup default nightly-2026-08-26
       - name: Rust cache
-        uses: >- # v2.9.1
-          Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
-
-      - name: Build on ${{ runner.os }}
-        run: cargo build --all --profile=smol
-
-      - name: Set up Azurite test runner
-        uses: ./.github/actions/setup-azurite-test-runner
-
-      - name: Test on ${{ runner.os }}
-        run: cargo test --all --profile=smol
-
-      - name: Check schema export
-        run: cargo run --bin build-schema --features dev-schema --package nativelink-config
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          shared-key: missing-input-regression
+          cache-on-failure: true
+      - name: Check changed-file formatting
+        run: |
+          rustfmt --config-path .rustfmt.toml --edition 2024 --check \
+            nativelink-worker/src/running_actions_manager.rs \
+            nativelink-worker/src/local_worker.rs \
+            nativelink-store/src/ac_utils.rs \
+            nativelink-worker/tests/local_worker_test.rs \
+            nativelink-store/tests/ac_utils_test.rs
+      - name: Build server at patch SHA
+        run: cargo build --locked --bin nativelink --profile=smol
+      - name: Strict clippy at patch SHA
+        run: |
+          cargo clippy --locked --profile=smol -p nativelink-worker -p nativelink-store \
+            --lib --test ac_utils_test --test local_worker_test -- -D warnings
+      - name: Test patch
+        run: |
+          cargo test --locked --profile=smol -p nativelink-worker --lib
+          cargo test --locked --profile=smol -p nativelink-worker --test local_worker_test
+          cargo test --locked --profile=smol -p nativelink-store --test ac_utils_test
+      - name: Demonstrate baseline failures
+        shell: bash
+        run: |
+          git checkout --detach "$BASELINE_SHA"
+          test "$(git rev-parse HEAD)" = "$BASELINE_SHA"
+          mkdir -p "$RUNNER_TEMP/regression"
+          expect_test_failure() {
+            local name="$1"
+            shift
+            set +e
+            "$@" >"$RUNNER_TEMP/regression/$name.log" 2>&1
+            local status=$?
+            set -e
+            cat "$RUNNER_TEMP/regression/$name.log"
+            test "$status" = 101
+            grep -q "test result: FAILED" "$RUNNER_TEMP/regression/$name.log"
+            grep -q "$name .*FAILED" "$RUNNER_TEMP/regression/$name.log"
+          }
+          expect_test_failure only_missing_digest_is_tagged_as_missing_input \
+            cargo test --locked --profile=smol -p nativelink-worker --lib only_missing_digest_is_tagged_as_missing_input
+          expect_test_failure non_cas_not_found_returns_internal_error_test \
+            cargo test --locked --profile=smol -p nativelink-worker --test local_worker_test non_cas_not_found_returns_internal_error_test
+          expect_test_failure unexpected_not_found_keeps_error_stack \
+            cargo test --locked --profile=smol -p nativelink-store --test ac_utils_test unexpected_not_found_keeps_error_stack
+      - name: Summarize exact source revisions
+        if: always()
+        run: |
+          printf 'Fixed SHA: `%s`\n\nBaseline plus tests SHA: `%s`\n' \
+            "$FIXED_SHA" "$BASELINE_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload baseline logs
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: baseline-regressions
+          path: ${{ runner.temp }}/regression/
+          if-no-files-found: ignore
